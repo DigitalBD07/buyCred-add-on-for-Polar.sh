@@ -2,8 +2,8 @@
 /**
  * Plugin Name: myCred Polar.sh Points Purchase
  * Plugin URI: https://devbd.net
- * Description: Purchase myCred points via Polar.sh. Includes webhook verification (Svix / Standard Webhooks), server-side fallback credit on success, and transaction logging.
- * Version: 2.4.0
+ * Description: Purchase myCred points or subscribe via Polar.sh. Award points on the order.paid (one-time & recurring)
+ * Version: 2.4.1
  * Author: Tanvir Haider
  * License: GPL-2.0-or-later
  * Text Domain: mycred-polar
@@ -13,12 +13,12 @@
 if (!defined('ABSPATH')) exit;
 
 /* -----------------------------------------------------------
-   myCred dependency check
+   Dependency & constants
 ----------------------------------------------------------- */
 function mycred_polar_check_mycred() {
     if (!function_exists('mycred')) {
         add_action('admin_notices', function() {
-            echo '<div class="error"><p><strong>myCred Polar.sh Points Purchase</strong> requires the myCred plugin to be installed and activated.</p></div>';
+            echo '<div class="error"><p><strong>myCred Polar.sh</strong> requires the myCred plugin to be installed and activated.</p></div>';
         });
         return false;
     }
@@ -30,13 +30,13 @@ add_action('plugins_loaded', 'mycred_polar_check_mycred');
    Admin menu
 ----------------------------------------------------------- */
 function mycred_polar_add_admin_menu() {
-    add_menu_page('myCred Polar.sh Settings', 'myCred Polar.sh', 'manage_options', 'mycred_polar_settings', 'mycred_polar_settings_page_html', 'dashicons-money-alt', 80);
+    add_menu_page('myCred Polar.sh', 'myCred Polar.sh', 'manage_options', 'mycred_polar_settings', 'mycred_polar_settings_page_html', 'dashicons-money-alt', 80);
     add_submenu_page('mycred_polar_settings', 'Transaction Logs', 'Transaction Logs', 'manage_options', 'mycred_polar_logs', 'mycred_polar_logs_page_html');
 }
 add_action('admin_menu', 'mycred_polar_add_admin_menu');
 
 /* -----------------------------------------------------------
-   Settings
+   Options
 ----------------------------------------------------------- */
 function mycred_polar_settings_init() {
     register_setting('mycred_polar_settings_group', 'mycred_polar_options', 'mycred_polar_sanitize_options');
@@ -47,15 +47,17 @@ function mycred_polar_settings_init() {
         'mode' => array('Payment Mode', 'mycred_polar_field_mode_html'),
         'access_token_live' => array('Live Access Token', 'mycred_polar_field_access_token_live_html'),
         'access_token_sandbox' => array('Sandbox Access Token', 'mycred_polar_field_access_token_sandbox_html'),
-        'product_id_live' => array('Live Product ID', 'mycred_polar_field_product_id_live_html'),
-        'product_id_sandbox' => array('Sandbox Product ID', 'mycred_polar_field_product_id_sandbox_html'),
+        'product_id_live' => array('Live One‑Time Product ID (PWYW or fixed)', 'mycred_polar_field_product_id_live_html'),
+        'product_id_sandbox' => array('Sandbox One‑Time Product ID (PWYW or fixed)', 'mycred_polar_field_product_id_sandbox_html'),
         'exchange_rate' => array('Exchange Rate ($ per Point)', 'mycred_polar_field_exchange_rate_html'),
         'min_points' => array('Minimum Points', 'mycred_polar_field_min_points_html'),
         'default_points' => array('Default Points', 'mycred_polar_field_default_points_html'),
         'point_type' => array('myCred Point Type', 'mycred_polar_field_point_type_html'),
-        'webhook_secret' => array('Polar.sh Webhook Secret', 'mycred_polar_field_webhook_secret_html'),
-        'log_entry' => array('Log Entry Template', 'mycred_polar_field_log_entry_html'),
+        'webhook_secret' => array('Polar Webhook Secret (whsec_…)', 'mycred_polar_field_webhook_secret_html'),
+        'subscription_plans' => array('Subscription Plans', 'mycred_polar_field_subscription_plans_html'),
+        'log_entry' => array('myCred Log Entry Template', 'mycred_polar_field_log_entry_html'),
     );
+
     foreach ($fields as $key => $field) {
         add_settings_field('mycred_polar_' . $key, $field[0], $field[1], 'mycred_polar_settings', 'mycred_polar_main_section');
     }
@@ -74,109 +76,207 @@ function mycred_polar_get_options() {
         'default_points' => 100,
         'point_type' => 'mycred_default',
         'webhook_secret' => '',
+        'subscription_plans' => array(), // array of arrays: name, product_id, points_per_cycle, use_custom_amount
         'log_entry' => 'Points purchased via Polar.sh (Order: %order_id%)',
     );
     $stored = get_option('mycred_polar_options', array());
     if (!is_array($stored)) $stored = array();
-    return wp_parse_args($stored, $defaults);
+    $merged = wp_parse_args($stored, $defaults);
+
+    // Ensure plans is array
+    if (!is_array($merged['subscription_plans'])) $merged['subscription_plans'] = array();
+    return $merged;
 }
 
-/* Settings fields */
-function mycred_polar_field_mode_html() { $o = mycred_polar_get_options(); $mode = $o['mode'] ?? 'sandbox'; ?>
-    <select id="mycred_polar_mode" name="mycred_polar_options[mode]">
-        <option value="sandbox" <?php selected($mode, 'sandbox'); ?>>Sandbox (Test Mode)</option>
-        <option value="live" <?php selected($mode, 'live'); ?>>Live (Production Mode)</option>
-    </select>
-    <p class="description">Use Sandbox to test payments without charging real cards.</p>
-<?php }
-function mycred_polar_field_access_token_live_html() { $o = mycred_polar_get_options(); ?>
-    <input type="password" name="mycred_polar_options[access_token_live]" value="<?php echo esc_attr($o['access_token_live'] ?? ''); ?>" class="regular-text">
-    <p class="description">Production token (starts with polar_at_)</p>
-<?php }
-function mycred_polar_field_access_token_sandbox_html() { $o = mycred_polar_get_options(); ?>
-    <input type="password" name="mycred_polar_options[access_token_sandbox]" value="<?php echo esc_attr($o['access_token_sandbox'] ?? ''); ?>" class="regular-text">
-    <p class="description">Sandbox token (starts with polar_at_)</p>
-<?php }
-function mycred_polar_field_product_id_live_html() { $o = mycred_polar_get_options(); ?>
-    <input type="text" name="mycred_polar_options[product_id_live]" value="<?php echo esc_attr($o['product_id_live'] ?? ''); ?>" class="regular-text">
-    <p class="description">PWYW Product ID (format: prod_xxxxx or UUID).</p>
-<?php }
-function mycred_polar_field_product_id_sandbox_html() { $o = mycred_polar_get_options(); ?>
-    <input type="text" name="mycred_polar_options[product_id_sandbox]" value="<?php echo esc_attr($o['product_id_sandbox'] ?? ''); ?>" class="regular-text">
-    <p class="description">Sandbox PWYW Product ID.</p>
-<?php }
-function mycred_polar_field_exchange_rate_html() { $o = mycred_polar_get_options(); ?>
-    <input type="number" step="0.001" min="0.001" name="mycred_polar_options[exchange_rate]" value="<?php echo esc_attr($o['exchange_rate'] ?? 0.10); ?>" class="small-text">
-    <p class="description">Price per point in USD (e.g. 0.10 = $0.10).</p>
-<?php }
-function mycred_polar_field_min_points_html() { $o = mycred_polar_get_options(); ?>
-    <input type="number" step="1" min="1" name="mycred_polar_options[min_points]" value="<?php echo esc_attr($o['min_points'] ?? 50); ?>" class="small-text">
-<?php }
-function mycred_polar_field_default_points_html() { $o = mycred_polar_get_options(); ?>
-    <input type="number" step="1" min="1" name="mycred_polar_options[default_points]" value="<?php echo esc_attr($o['default_points'] ?? 100); ?>" class="small-text">
-<?php }
-function mycred_polar_field_point_type_html() {
-    $o = mycred_polar_get_options();
-    $point_type = $o['point_type'] ?? 'mycred_default';
-    $types = array('mycred_default' => 'Default Points');
-    if (function_exists('mycred_get_types')) {
-        $tmp = mycred_get_types();
-        if (!empty($tmp)) { $types = array(); foreach ($tmp as $k => $lbl) $types[$k] = $lbl; }
-    } ?>
-    <select name="mycred_polar_options[point_type]">
-        <?php foreach ($types as $k => $lbl): ?>
-            <option value="<?php echo esc_attr($k); ?>" <?php selected($point_type, $k); ?>><?php echo esc_html($lbl); ?></option>
-        <?php endforeach; ?>
-    </select>
-    <p class="description">Which myCred point type to award.</p>
-<?php }
-function mycred_polar_field_webhook_secret_html() { $o = mycred_polar_get_options(); ?>
-    <input type="text" name="mycred_polar_options[webhook_secret]" value="<?php echo esc_attr($o['webhook_secret'] ?? ''); ?>" class="regular-text">
-    <p class="description">Webhook secret from Polar (starts with whsec_). In Polar → Webhooks use Format: Raw and enable event <code>order.paid</code> (recommended). </p>
-<?php }
-function mycred_polar_field_log_entry_html() { $o = mycred_polar_get_options(); ?>
-    <input type="text" name="mycred_polar_options[log_entry]" value="<?php echo esc_attr($o['log_entry'] ?? 'Points purchased via Polar.sh (Order: %order_id%)'); ?>" class="regular-text">
-    <p class="description">Vars: %points%, %order_id%, %amount%</p>
-<?php }
-
 function mycred_polar_sanitize_options($input) {
-    return array(
-        'mode' => (!empty($input['mode']) && $input['mode'] === 'live') ? 'live' : 'sandbox',
-        'access_token_live' => sanitize_text_field($input['access_token_live'] ?? ''),
-        'access_token_sandbox' => sanitize_text_field($input['access_token_sandbox'] ?? ''),
-        'product_id_live' => sanitize_text_field($input['product_id_live'] ?? ''),
-        'product_id_sandbox' => sanitize_text_field($input['product_id_sandbox'] ?? ''),
-        'exchange_rate' => floatval($input['exchange_rate'] ?? 0.10),
-        'min_points' => intval($input['min_points'] ?? 50),
-        'default_points' => intval($input['default_points'] ?? 100),
-        'point_type' => sanitize_text_field($input['point_type'] ?? 'mycred_default'),
-        'webhook_secret' => sanitize_text_field($input['webhook_secret'] ?? ''),
-        'log_entry' => sanitize_text_field($input['log_entry'] ?? 'Points purchased via Polar.sh (Order: %order_id%)'),
-    );
+    $san = array();
+    $san['mode'] = (!empty($input['mode']) && $input['mode'] === 'live') ? 'live' : 'sandbox';
+    $san['access_token_live'] = sanitize_text_field($input['access_token_live'] ?? '');
+    $san['access_token_sandbox'] = sanitize_text_field($input['access_token_sandbox'] ?? '');
+    $san['product_id_live'] = sanitize_text_field($input['product_id_live'] ?? '');
+    $san['product_id_sandbox'] = sanitize_text_field($input['product_id_sandbox'] ?? '');
+    $san['exchange_rate'] = floatval($input['exchange_rate'] ?? 0.10);
+    $san['min_points'] = intval($input['min_points'] ?? 50);
+    $san['default_points'] = intval($input['default_points'] ?? 100);
+    $san['point_type'] = sanitize_text_field($input['point_type'] ?? 'mycred_default');
+    $san['webhook_secret'] = sanitize_text_field($input['webhook_secret'] ?? '');
+    $san['log_entry'] = sanitize_text_field($input['log_entry'] ?? 'Points purchased via Polar.sh (Order: %order_id%)');
+
+    // Plans
+    $plans = array();
+    if (!empty($input['subscription_plans_json'])) {
+        $dec = json_decode(wp_unslash($input['subscription_plans_json']), true);
+        if (is_array($dec)) {
+            foreach ($dec as $p) {
+                $plans[] = array(
+                    'name' => sanitize_text_field($p['name'] ?? ''),
+                    'product_id' => sanitize_text_field($p['product_id'] ?? ''),
+                    'points_per_cycle' => intval($p['points_per_cycle'] ?? 0),
+                    'use_custom_amount' => !empty($p['use_custom_amount']) ? 1 : 0,
+                );
+            }
+        }
+    } elseif (!empty($input['subscription_plans']) && is_array($input['subscription_plans'])) {
+        foreach ($input['subscription_plans'] as $p) {
+            $plans[] = array(
+                'name' => sanitize_text_field($p['name'] ?? ''),
+                'product_id' => sanitize_text_field($p['product_id'] ?? ''),
+                'points_per_cycle' => intval($p['points_per_cycle'] ?? 0),
+                'use_custom_amount' => !empty($p['use_custom_amount']) ? 1 : 0,
+            );
+        }
+    }
+    $san['subscription_plans'] = $plans;
+
+    return $san;
 }
 
 /* -----------------------------------------------------------
-   Settings page
+   Settings UI fields
+----------------------------------------------------------- */
+function mycred_polar_field_mode_html() {
+    $o = mycred_polar_get_options(); $mode = $o['mode']; ?>
+    <select name="mycred_polar_options[mode]">
+        <option value="sandbox" <?php selected($mode,'sandbox'); ?>>Sandbox (Test)</option>
+        <option value="live" <?php selected($mode,'live'); ?>>Live (Production)</option>
+    </select>
+    <p class="description">Sandbox is safe for test cards.</p>
+<?php }
+function mycred_polar_field_access_token_live_html() { $o = mycred_polar_get_options(); ?>
+    <input type="password" name="mycred_polar_options[access_token_live]" value="<?php echo esc_attr($o['access_token_live']); ?>" class="regular-text">
+    <p class="description">Live Organization Access Token (starts with polar_at_). Scopes: products:read, checkouts:write, orders:read, subscriptions:read.</p>
+<?php }
+function mycred_polar_field_access_token_sandbox_html() { $o = mycred_polar_get_options(); ?>
+    <input type="password" name="mycred_polar_options[access_token_sandbox]" value="<?php echo esc_attr($o['access_token_sandbox']); ?>" class="regular-text">
+    <p class="description">Sandbox Organization Access Token (starts with polar_at_).</p>
+<?php }
+function mycred_polar_field_product_id_live_html() { $o = mycred_polar_get_options(); ?>
+    <input type="text" name="mycred_polar_options[product_id_live]" value="<?php echo esc_attr($o['product_id_live']); ?>" class="regular-text">
+    <p class="description">Live Product ID for one-time points. PWYW or fixed. Example: prod_xxxxx (UUID).</p>
+<?php }
+function mycred_polar_field_product_id_sandbox_html() { $o = mycred_polar_get_options(); ?>
+    <input type="text" name="mycred_polar_options[product_id_sandbox]" value="<?php echo esc_attr($o['product_id_sandbox']); ?>" class="regular-text">
+    <p class="description">Sandbox Product ID for one-time points.</p>
+<?php }
+function mycred_polar_field_exchange_rate_html() { $o = mycred_polar_get_options(); ?>
+    <input type="number" step="0.001" min="0.001" name="mycred_polar_options[exchange_rate]" value="<?php echo esc_attr($o['exchange_rate']); ?>" class="small-text"> USD per point
+<?php }
+function mycred_polar_field_min_points_html() { $o = mycred_polar_get_options(); ?>
+    <input type="number" step="1" min="1" name="mycred_polar_options[min_points]" value="<?php echo esc_attr($o['min_points']); ?>" class="small-text">
+<?php }
+function mycred_polar_field_default_points_html() { $o = mycred_polar_get_options(); ?>
+    <input type="number" step="1" min="1" name="mycred_polar_options[default_points]" value="<?php echo esc_attr($o['default_points']); ?>" class="small-text">
+<?php }
+function mycred_polar_field_point_type_html() {
+    $o = mycred_polar_get_options();
+    $pt = $o['point_type']; $types = array('mycred_default' => 'Default Points');
+    if (function_exists('mycred_get_types')) {
+        $mts = mycred_get_types(); if (!empty($mts)) { $types=array(); foreach($mts as $k=>$lbl) $types[$k]=$lbl; }
+    } ?>
+    <select name="mycred_polar_options[point_type]">
+        <?php foreach($types as $k=>$lbl): ?>
+            <option value="<?php echo esc_attr($k); ?>" <?php selected($pt,$k); ?>><?php echo esc_html($lbl); ?></option>
+        <?php endforeach; ?>
+    </select>
+<?php }
+function mycred_polar_field_webhook_secret_html() { $o = mycred_polar_get_options(); $url=esc_html(rest_url('mycred-polar/v1/webhook')); ?>
+    <input type="text" name="mycred_polar_options[webhook_secret]" value="<?php echo esc_attr($o['webhook_secret']); ?>" class="regular-text">
+    <p class="description">Paste your Polar webhook secret (whsec_…). Set Webhook Format: Raw. Enable event: <code>order.paid</code> (you can leave <code>order.updated</code> off). Endpoint: <code><?php echo $url; ?></code></p>
+<?php }
+function mycred_polar_field_subscription_plans_html() {
+    $o = mycred_polar_get_options();
+    $plans = $o['subscription_plans']; ?>
+    <style>
+        .mp-sub-table th, .mp-sub-table td { padding:6px; }
+        .mp-sub-table input[type="text"], .mp-sub-table input[type="number"] { width: 100%; }
+        .mp-sub-compact { font-size:12px; color:#666; }
+        .mp-sub-del { color:#b32d2e; cursor:pointer; }
+        .mp-sub-add { margin-top:8px; }
+        textarea#mp-plans-json { width:100%; height:120px; }
+    </style>
+    <p>Define subscription plans (recurring Polar products). For PWYW subscriptions, check “Use custom amount” and the amount will be computed from points_per_cycle × exchange_rate.</p>
+    <table class="widefat mp-sub-table">
+        <thead><tr><th>Name (shown to users)</th><th>Polar Product ID (recurring)</th><th>Points per cycle</th><th>Use custom amount?</th><th></th></tr></thead>
+        <tbody id="mp-plans-body">
+        <?php if (empty($plans)): ?>
+            <tr>
+                <td><input type="text" data-k="name" value=""></td>
+                <td><input type="text" data-k="product_id" value=""></td>
+                <td><input type="number" min="1" step="1" data-k="points_per_cycle" value="100"></td>
+                <td style="text-align:center;"><input type="checkbox" data-k="use_custom_amount"></td>
+                <td><span class="mp-sub-del" title="Remove">✕</span></td>
+            </tr>
+        <?php else: foreach($plans as $p): ?>
+            <tr>
+                <td><input type="text" data-k="name" value="<?php echo esc_attr($p['name']); ?>"></td>
+                <td><input type="text" data-k="product_id" value="<?php echo esc_attr($p['product_id']); ?>"></td>
+                <td><input type="number" min="1" step="1" data-k="points_per_cycle" value="<?php echo esc_attr($p['points_per_cycle']); ?>"></td>
+                <td style="text-align:center;"><input type="checkbox" data-k="use_custom_amount" <?php checked(!empty($p['use_custom_amount'])); ?>></td>
+                <td><span class="mp-sub-del" title="Remove">✕</span></td>
+            </tr>
+        <?php endforeach; endif; ?>
+        </tbody>
+    </table>
+    <button type="button" class="button mp-sub-add">+ Add Plan</button>
+    <p class="mp-sub-compact">These plans are stored as JSON below for reliability. You can also edit the JSON directly if needed.</p>
+    <textarea id="mp-plans-json" name="mycred_polar_options[subscription_plans_json]"><?php echo esc_textarea(wp_json_encode($plans)); ?></textarea>
+    <script>
+    (function(){
+        const body = document.getElementById('mp-plans-body');
+        const jsonTA = document.getElementById('mp-plans-json');
+        function readTable(){
+            const rows = [...body.querySelectorAll('tr')];
+            const out = [];
+            rows.forEach(tr=>{
+                const name = tr.querySelector('input[data-k="name"]')?.value?.trim() || '';
+                const product_id = tr.querySelector('input[data-k="product_id"]')?.value?.trim() || '';
+                const points = parseInt(tr.querySelector('input[data-k="points_per_cycle"]')?.value || '0', 10) || 0;
+                const custom = tr.querySelector('input[data-k="use_custom_amount"]')?.checked ? 1 : 0;
+                if (name || product_id) out.push({name, product_id, points_per_cycle: points, use_custom_amount: custom});
+            });
+            jsonTA.value = JSON.stringify(out, null, 2);
+        }
+        function addRow(data={}){
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td><input type="text" data-k="name" value="${data.name||''}"></td>
+                <td><input type="text" data-k="product_id" value="${data.product_id||''}"></td>
+                <td><input type="number" min="1" step="1" data-k="points_per_cycle" value="${data.points_per_cycle||100}"></td>
+                <td style="text-align:center;"><input type="checkbox" data-k="use_custom_amount" ${data.use_custom_amount? 'checked':''}></td>
+                <td><span class="mp-sub-del" title="Remove">✕</span></td>`;
+            body.appendChild(tr);
+        }
+        document.querySelector('.mp-sub-add').addEventListener('click', ()=>{ addRow(); });
+        body.addEventListener('input', readTable);
+        body.addEventListener('change', readTable);
+        body.addEventListener('click', (e)=>{ if (e.target.classList.contains('mp-sub-del')) { e.target.closest('tr').remove(); readTable(); }});
+        // keep JSON and table in sync on initial display
+        body.addEventListener('DOMNodeInserted', readTable);
+        readTable();
+    })();
+    </script>
+<?php }
+function mycred_polar_field_log_entry_html() { $o = mycred_polar_get_options(); ?>
+    <input type="text" name="mycred_polar_options[log_entry]" value="<?php echo esc_attr($o['log_entry']); ?>" class="regular-text">
+    <p class="description">Use %points%, %order_id%, %amount%. Example: "Points purchased via Polar.sh (Order: %order_id%)".</p>
+<?php }
+
+/* -----------------------------------------------------------
+   Settings page shell
 ----------------------------------------------------------- */
 function mycred_polar_settings_page_html() {
     if (!current_user_can('manage_options')) return;
-    $webhook_url = esc_html(rest_url('mycred-polar/v1/webhook'));
-    ?>
+    $webhook_url = esc_html(rest_url('mycred-polar/v1/webhook')); ?>
     <div class="wrap">
         <h1><?php echo esc_html(get_admin_page_title()); ?></h1>
+
         <div class="notice notice-info" style="padding: 15px;">
-            <h3>📋 Setup</h3>
+            <h3>Setup</h3>
             <ol>
-                <li>Create a Polar PWYW product (copy Product ID)</li>
-                <li>Create an Access Token with scopes: <code>products:read</code>, <code>checkouts:write</code>, <code>orders:read</code></li>
-                <li>Webhook (Format: Raw):
-                    <ul>
-                        <li>URL: <code><?php echo $webhook_url; ?></code></li>
-                        <li>Events: <code>order.paid</code> (recommended), optional <code>checkout.updated</code></li>
-                        <li>Secret: <code>whsec_…</code> (paste below)</li>
-                    </ul>
-                </li>
-                <li>Add shortcode <code>[mycred_polar_form]</code> to a page.</li>
+                <li>Create a Polar product for one-time points (PWYW or fixed). For subscriptions, create monthly or yearly products.</li>
+                <li>Create an Access Token with scopes: <code>products:read</code>, <code>checkouts:write</code>, <code>orders:read</code>, <code>subscriptions:read</code>.</li>
+                <li>Webhooks (Format: Raw): Endpoint <code><?php echo $webhook_url; ?></code>. Enable <code>order.paid</code>.</li>
+                <li>Fill the form below and Save. Then Test Connection.</li>
+                <li>Place <code>[mycred_polar_form]</code> on a page.</li>
             </ol>
         </div>
 
@@ -188,31 +288,27 @@ function mycred_polar_settings_page_html() {
 
         <hr>
         <h2>🧪 Test Connection</h2>
-        <button type="button" id="test-polar-connection" class="button button-primary">Test Connection</button>
-        <div id="test-result" style="margin-top: 10px;"></div>
+        <button type="button" id="mp-test-btn" class="button button-primary">Test Connection</button>
+        <div id="mp-test-result" style="margin-top:10px;"></div>
 
         <script>
-        document.getElementById('test-polar-connection').addEventListener('click', function() {
-            const btn = this, result = document.getElementById('test-result');
-            btn.disabled = true; btn.textContent = 'Testing...'; result.innerHTML = '';
-            fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: 'action=mycred_polar_test_connection&nonce=<?php echo wp_create_nonce('mycred_polar_test'); ?>'
-            })
-            .then(r => r.json())
-            .then(data => {
-                if (data.success) {
-                    result.innerHTML = '<div class="notice notice-success inline" style="padding: 10px; margin: 0;"><p style="margin:0;">✅ ' + data.data.message + '</p></div>';
-                } else {
-                    result.innerHTML = '<div class="notice notice-error inline" style="padding: 10px; margin: 0;"><p style="margin:0;">❌ ' + (data.data?.message || 'Failed') + '</p></div>';
-                }
-            })
-            .catch(err => {
-                result.innerHTML = '<div class="notice notice-error inline" style="padding: 10px; margin: 0;"><p style="margin:0;">❌ Error: ' + err.message + '</p></div>';
-            })
-            .finally(() => { btn.disabled = false; btn.textContent = 'Test Connection'; });
-        });
+        (function(){
+            const btn = document.getElementById('mp-test-btn');
+            const res = document.getElementById('mp-test-result');
+            btn.addEventListener('click', function(){
+                btn.disabled = true; btn.textContent='Testing...'; res.innerHTML='';
+                fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                    method:'POST',
+                    headers:{'Content-Type':'application/x-www-form-urlencoded'},
+                    body:'action=mycred_polar_test_connection&nonce=<?php echo wp_create_nonce('mycred_polar_test'); ?>'
+                }).then(r=>r.json()).then(d=>{
+                    if (d.success) res.innerHTML = '<div class="notice notice-success inline" style="padding:10px;"><p>✅ '+d.data.message+'</p></div>';
+                    else res.innerHTML = '<div class="notice notice-error inline" style="padding:10px;"><p>❌ '+(d.data?.message||'Failed')+'</p></div>';
+                }).catch(e=>{
+                    res.innerHTML = '<div class="notice notice-error inline" style="padding:10px;"><p>❌ '+e.message+'</p></div>';
+                }).finally(()=>{ btn.disabled=false; btn.textContent='Test Connection'; });
+            });
+        })();
         </script>
     </div>
     <?php
@@ -250,9 +346,9 @@ function mycred_polar_logs_page_html() {
 }
 
 /* -----------------------------------------------------------
-   Activation (logs table + rewrites)
+   Activation: logs table + rewrites
 ----------------------------------------------------------- */
-function mycred_polar_activate() {
+function mycred_polar_ensure_logs_table() {
     global $wpdb;
     $table = $wpdb->prefix . 'mycred_polar_logs';
     $charset_collate = $wpdb->get_charset_collate();
@@ -271,7 +367,18 @@ function mycred_polar_activate() {
     ) $charset_collate;";
     require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
     dbDelta($sql);
+}
+add_action('plugins_loaded', 'mycred_polar_ensure_logs_table');
 
+function mycred_polar_rewrite_rules() { add_rewrite_rule('^mycred-success/?', 'index.php?mycred_polar_success=1', 'top'); }
+add_action('init', 'mycred_polar_rewrite_rules');
+function mycred_polar_query_vars($vars) { $vars[]='mycred_polar_success'; return $vars; }
+add_filter('query_vars', 'mycred_polar_query_vars');
+function mycred_polar_template_redirect() { if (get_query_var('mycred_polar_success')) mycred_polar_success_page(); }
+add_action('template_redirect', 'mycred_polar_template_redirect');
+
+function mycred_polar_activate() {
+    mycred_polar_ensure_logs_table();
     mycred_polar_rewrite_rules();
     flush_rewrite_rules();
 }
@@ -279,95 +386,107 @@ register_activation_hook(__FILE__, 'mycred_polar_activate');
 register_deactivation_hook(__FILE__, 'flush_rewrite_rules');
 
 /* -----------------------------------------------------------
-   Shortcode - purchase form
+   Shortcode UI
 ----------------------------------------------------------- */
 function mycred_polar_render_form_shortcode() {
     if (!mycred_polar_check_mycred()) return '<p style="color:red;">myCred plugin is required.</p>';
-    if (!is_user_logged_in()) return '<p>You must be logged in to purchase points. <a href="' . esc_url(wp_login_url(get_permalink())) . '">Login here</a>.</p>';
+    if (!is_user_logged_in()) return '<p>You must be logged in to purchase points. <a href="'.esc_url(wp_login_url(get_permalink())).'">Login here</a>.</p>';
 
     $o = mycred_polar_get_options();
-    $exchange_rate = floatval($o['exchange_rate']);
-    $min_points = intval($o['min_points']);
-    $default_points = intval($o['default_points']);
+    $ex = floatval($o['exchange_rate']);
+    $minp = intval($o['min_points']);
+    $defp = intval($o['default_points']);
+    $plans = $o['subscription_plans'];
     $user = wp_get_current_user();
-    $mycred = mycred($o['point_type']);
-    $current_balance = $mycred->get_users_balance($user->ID);
+    $myc = mycred($o['point_type']);
+    $bal = $myc->get_users_balance($user->ID);
 
     ob_start(); ?>
-    <div id="mycred-polar-form-wrapper" style="max-width: 500px; padding: 20px; border: 2px solid #0073aa; border-radius: 8px; background: #f9f9f9;">
-        <h3 style="margin-top: 0;">💎 Purchase myCred Points</h3>
-        <div style="background: white; padding: 15px; border-radius: 5px; margin-bottom: 15px;">
-            <p style="margin: 0;"><strong>Current Balance:</strong> <?php echo $mycred->format_creds($current_balance); ?></p>
+    <div id="mycred-polar-form-wrapper" style="max-width: 750px; padding: 20px; border: 2px solid #0073aa; border-radius: 8px; background: #f9f9f9;">
+        <h3 style="margin-top:0;">💎 myCred Points</h3>
+        <div style="display:flex; gap:16px; flex-wrap:wrap;">
+            <div style="flex:1; min-width:320px; background:#fff; padding:15px; border-radius:6px;">
+                <h4>One‑time purchase</h4>
+                <p><strong>Current Balance:</strong> <?php echo $myc->format_creds($bal); ?></p>
+                <p><strong>Rate:</strong> $<?php echo esc_html(number_format($ex,3)); ?> per point</p>
+                <label><strong>Points:</strong></label>
+                <input type="number" id="mp-pts" value="<?php echo esc_attr($defp); ?>" min="<?php echo esc_attr($minp); ?>" step="1" style="width:100%; padding:10px; margin:8px 0; border:1px solid #ddd; border-radius:4px;">
+                <div style="background:#0073aa;color:#fff;padding:10px;border-radius:4px;text-align:center;">
+                    <strong>$<span id="mp-cost">0.00</span></strong>
+                </div>
+                <button id="mp-buy" class="button button-primary" style="margin-top:10px;width:100%;">🛒 Purchase Now</button>
+                <p id="mp-one-err" style="color:red; display:none; font-weight:bold;"></p>
+                <p id="mp-one-load" style="display:none;">⏳ Creating checkout…</p>
+            </div>
+
+            <div style="flex:1; min-width:320px; background:#fff; padding:15px; border-radius:6px;">
+                <h4>Subscription (recurring points)</h4>
+                <?php if (empty($plans)): ?>
+                    <p>No subscription plans configured. Ask admin to add some in settings.</p>
+                <?php else: ?>
+                    <label><strong>Select plan:</strong></label>
+                    <select id="mp-plan" style="width:100%; padding:10px; margin:8px 0; border:1px solid #ddd; border-radius:4px;">
+                        <?php foreach($plans as $idx=>$p): 
+                            $amt = !empty($p['use_custom_amount']) ? (intval($p['points_per_cycle']) * $ex) : null;
+                            $label = $p['name'].' — '.$p['points_per_cycle'].' pts/cycle';
+                            if ($amt !== null) $label .= ' ($'.number_format($amt,2).')';
+                        ?>
+                            <option value="<?php echo esc_attr($idx); ?>"><?php echo esc_html($label); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <button id="mp-sub" class="button button-primary" style="width:100%;">🔁 Subscribe</button>
+                    <p id="mp-sub-err" style="color:red; display:none; font-weight:bold;"></p>
+                    <p id="mp-sub-load" style="display:none;">⏳ Creating subscription checkout…</p>
+                <?php endif; ?>
+            </div>
         </div>
-        <p><strong>Exchange Rate:</strong> $<?php echo esc_html(number_format($exchange_rate, 3)); ?> per point</p>
-        <label for="mycred-points-input"><strong>Enter number of points:</strong></label>
-        <input type="number" id="mycred-points-input" value="<?php echo esc_attr($default_points); ?>" min="<?php echo esc_attr($min_points); ?>" step="1" style="padding: 10px; font-size: 16px; width: 100%; margin: 10px 0; border: 2px solid #ddd; border-radius: 4px;">
-        <div id="mycred-cost-display" style="background: #0073aa; color: white; padding: 15px; margin: 15px 0; border-radius: 5px; text-align: center;">
-            <strong style="font-size: 24px;">$<span id="mycred-cost-amount">0.00</span></strong>
-        </div>
-        <button id="mycred-polar-pay-button" style="padding: 15px 30px; font-size: 18px; cursor: pointer; width: 100%; background: #00a32a; color: white; border: none; border-radius: 5px; font-weight: bold;">🛒 Purchase Now</button>
-        <p id="mycred-error-msg" style="color: red; display: none; margin-top: 10px; font-weight: bold;"></p>
-        <p id="mycred-loading-msg" style="display: none; margin-top: 10px; text-align: center;">⏳ Creating checkout session...</p>
     </div>
+
     <script>
-    (function() {
-        const exchangeRate = <?php echo floatval($exchange_rate); ?>;
-        const minPoints = <?php echo intval($min_points); ?>;
-        const payButton = document.getElementById("mycred-polar-pay-button");
-        const pointsInput = document.getElementById("mycred-points-input");
-        const costDisplay = document.getElementById("mycred-cost-amount");
-        const errorText = document.getElementById("mycred-error-msg");
-        const loadingText = document.getElementById("mycred-loading-msg");
-        function updateCost() {
-            const points = parseInt(pointsInput.value) || 0;
-            const cost = points * exchangeRate;
-            costDisplay.textContent = cost.toFixed(2);
-        }
-        pointsInput.addEventListener("input", updateCost);
-        updateCost();
-        payButton.addEventListener("click", function() {
-            const points = parseInt(pointsInput.value);
-            if (isNaN(points) || points < minPoints) {
-                errorText.textContent = "Please enter at least " + minPoints + " points.";
-                errorText.style.display = "block";
-                return;
-            }
-            errorText.style.display = "none";
-            loadingText.style.display = "block";
-            payButton.disabled = true;
-            const costCents = Math.round((points * exchangeRate) * 100);
-            const formData = new URLSearchParams();
-            formData.append('action', 'mycred_polar_create_checkout');
-            formData.append('points', points);
-            formData.append('amount', costCents);
-            formData.append('nonce', '<?php echo wp_create_nonce('mycred_polar_checkout'); ?>');
-            fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: formData.toString()
-            })
-            .then(async (r) => {
-                const text = await r.text();
-                try { return JSON.parse(text); } catch (e) { throw new Error('AJAX returned non‑JSON: ' + text.slice(0, 300)); }
-            })
-            .then(data => {
-                if (data.success && data.data.url) {
-                    window.location.href = data.data.url;
-                } else {
-                    errorText.textContent = "Error: " + (data.data?.message || "Failed to create checkout");
-                    errorText.style.display = "block";
-                    loadingText.style.display = "none";
-                    payButton.disabled = false;
-                    console.error('Checkout error:', data);
-                }
-            })
-            .catch(error => {
-                errorText.textContent = "Error: " + error.message;
-                errorText.style.display = "block";
-                loadingText.style.display = "none";
-                payButton.disabled = false;
-                console.error('Checkout error:', error);
-            });
+    (function(){
+        const ex = <?php echo json_encode($ex); ?>;
+        const minp = <?php echo json_encode($minp); ?>;
+        const pts = document.getElementById('mp-pts');
+        const cost = document.getElementById('mp-cost');
+        const bbtn = document.getElementById('mp-buy');
+        const berr = document.getElementById('mp-one-err');
+        const bload= document.getElementById('mp-one-load');
+        function recalc(){ const p = parseInt(pts.value)||0; cost.textContent=(p*ex).toFixed(2); }
+        pts?.addEventListener('input', recalc); recalc();
+
+        bbtn?.addEventListener('click', function(){
+            const p = parseInt(pts.value);
+            if (isNaN(p)||p<minp){ berr.textContent='Please enter at least '+minp+' points.'; berr.style.display='block'; return; }
+            berr.style.display='none'; bload.style.display='block'; bbtn.disabled=true;
+            const cents = Math.round(p*ex*100);
+            const fd = new URLSearchParams();
+            fd.append('action','mycred_polar_create_checkout');
+            fd.append('points', p);
+            fd.append('amount', cents);
+            fd.append('nonce','<?php echo wp_create_nonce('mycred_polar_checkout'); ?>');
+            fetch('<?php echo admin_url('admin-ajax.php'); ?>',{ method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:fd.toString() })
+              .then(async r=>{ const t=await r.text(); try{return JSON.parse(t);}catch(e){ throw new Error('AJAX returned non‑JSON: '+t.slice(0,300)); }})
+              .then(d=>{ if(d.success && d.data.url){ window.location.href = d.data.url; } else { berr.textContent='Error: '+(d.data?.message||'Failed'); berr.style.display='block'; }})
+              .catch(e=>{ berr.textContent='Error: '+e.message; berr.style.display='block'; })
+              .finally(()=>{ bload.style.display='none'; bbtn.disabled=false; });
+        });
+
+        const sbtn = document.getElementById('mp-sub');
+        const sel  = document.getElementById('mp-plan');
+        const serr = document.getElementById('mp-sub-err');
+        const sload= document.getElementById('mp-sub-load');
+        sbtn?.addEventListener('click', function(){
+            if (!sel) return;
+            serr.style.display='none'; sload.style.display='block'; sbtn.disabled=true;
+            const fd = new URLSearchParams();
+            fd.append('action','mycred_polar_create_subscription_checkout');
+            fd.append('plan_index', sel.value);
+            fd.append('nonce','<?php echo wp_create_nonce('mycred_polar_checkout'); ?>');
+            fetch('<?php echo admin_url('admin-ajax.php'); ?>',{ method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:fd.toString() })
+              .then(async r=>{ const t=await r.text(); try{return JSON.parse(t);}catch(e){ throw new Error('AJAX returned non‑JSON: '+t.slice(0,300)); }})
+              .then(d=>{ if(d.success && d.data.url){ window.location.href = d.data.url; } else { serr.textContent='Error: '+(d.data?.message||'Failed'); serr.style.display='block'; }})
+              .catch(e=>{ serr.textContent='Error: '+e.message; serr.style.display='block'; })
+              .finally(()=>{ sload.style.display='none'; sbtn.disabled=false; });
         });
     })();
     </script>
@@ -377,350 +496,340 @@ function mycred_polar_render_form_shortcode() {
 add_shortcode('mycred_polar_form', 'mycred_polar_render_form_shortcode');
 
 /* -----------------------------------------------------------
-   AJAX - create checkout (POST /v1/checkouts, fallback to /custom)
+   AJAX: One-time checkout
 ----------------------------------------------------------- */
 function mycred_polar_create_checkout() {
-    check_ajax_referer('mycred_polar_checkout', 'nonce');
-    if (!is_user_logged_in()) wp_send_json_error(array('message' => 'User not logged in'));
+    check_ajax_referer('mycred_polar_checkout','nonce');
+    if (!is_user_logged_in()) wp_send_json_error(array('message'=>'User not logged in'));
 
     $points = intval($_POST['points'] ?? 0);
     $amount = intval($_POST['amount'] ?? 0); // cents
-    $user = wp_get_current_user();
+    $user   = wp_get_current_user();
     $o = mycred_polar_get_options();
 
-    $mode = $o['mode'] ?? 'sandbox';
-    $access_token = ($mode === 'live') ? ($o['access_token_live'] ?? '') : ($o['access_token_sandbox'] ?? '');
-    $product_id  = ($mode === 'live') ? ($o['product_id_live'] ?? '')     : ($o['product_id_sandbox'] ?? '');
-    $api_base    = ($mode === 'live') ? 'https://api.polar.sh' : 'https://sandbox-api.polar.sh';
+    $mode = $o['mode']; $access = ($mode==='live')? $o['access_token_live'] : $o['access_token_sandbox'];
+    $product_id = ($mode==='live')? $o['product_id_live'] : $o['product_id_sandbox'];
+    $api = ($mode==='live')? 'https://api.polar.sh' : 'https://sandbox-api.polar.sh';
 
-    if (empty($access_token) || empty($product_id)) {
-        wp_send_json_error(array('message' => 'Polar.sh not configured. Please contact administrator.'));
+    if (empty($access) || empty($product_id)) wp_send_json_error(array('message'=>'Polar.sh not configured.'));
+
+    $payload = array(
+        'products' => array($product_id),
+        'amount'   => $amount, // needed for PWYW; ignored for fixed
+        'customer_email' => $user->user_email,
+        'external_customer_id' => (string)$user->ID,
+        'metadata' => array(
+            'user_id' => (string)$user->ID,
+            'points'  => (string)$points,
+            'amount_cents' => (string)$amount,
+            'wp_user_email' => $user->user_email,
+            'reason' => 'one_time_points'
+        ),
+        'success_url' => get_site_url().'/mycred-success?checkout_id={CHECKOUT_ID}',
+    );
+
+    $resp = wp_remote_post($api.'/v1/checkouts', array(
+        'headers'=>array('Authorization'=>'Bearer '.$access,'Content-Type'=>'application/json'),
+        'body'=> wp_json_encode($payload),
+        'timeout'=>30,
+    ));
+    if (is_wp_error($resp)) wp_send_json_error(array('message'=>'API Error: '.$resp->get_error_message()));
+    $code = wp_remote_retrieve_response_code($resp);
+    $body = json_decode(wp_remote_retrieve_body($resp), true);
+    if (($code===200||$code===201) && isset($body['url'])) {
+        wp_send_json_success(array('url'=>$body['url'],'checkout_id'=>$body['id']??''));
+    }
+    $err = is_array($body)? ($body['detail'] ?? ($body['message'] ?? 'Unknown error')) : 'Unexpected response';
+    wp_send_json_error(array('message'=>'Checkout failed: '.$err,'status_code'=>$code,'response'=>$body));
+}
+add_action('wp_ajax_mycred_polar_create_checkout','mycred_polar_create_checkout');
+
+/* -----------------------------------------------------------
+   AJAX: Subscription checkout
+----------------------------------------------------------- */
+function mycred_polar_create_subscription_checkout() {
+    check_ajax_referer('mycred_polar_checkout','nonce');
+    if (!is_user_logged_in()) wp_send_json_error(array('message'=>'User not logged in'));
+
+    $idx = intval($_POST['plan_index'] ?? -1);
+    $o = mycred_polar_get_options();
+    $plans = $o['subscription_plans'];
+    if ($idx < 0 || !isset($plans[$idx])) wp_send_json_error(array('message'=>'Invalid plan.'));
+
+    $plan = $plans[$idx];
+    $user = wp_get_current_user();
+
+    $mode = $o['mode']; $access = ($mode==='live')? $o['access_token_live'] : $o['access_token_sandbox'];
+    $api  = ($mode==='live')? 'https://api.polar.sh' : 'https://sandbox-api.polar.sh';
+
+    if (empty($access) || empty($plan['product_id'])) wp_send_json_error(array('message'=>'Polar.sh not configured.'));
+
+    $use_custom = !empty($plan['use_custom_amount']);
+    $amount = 0;
+    if ($use_custom) {
+        $amount = intval(round(floatval($o['exchange_rate']) * intval($plan['points_per_cycle']) * 100));
     }
 
     $meta = array(
-        'user_id' => (string) $user->ID,
-        'points'  => (string) $points,
-        'amount_cents' => (string) $amount,
+        'user_id' => (string)$user->ID,
+        'points_per_cycle' => (string)intval($plan['points_per_cycle']),
+        'plan_name' => (string)$plan['name'],
+        'plan_index' => (string)$idx,
         'wp_user_email' => $user->user_email,
+        'reason' => 'subscription_points'
     );
 
     $payload = array(
-        'products'        => array($product_id),
-        'amount'          => $amount,
-        'customer_email'  => $user->user_email,
-        'metadata'        => $meta,
-        'success_url'     => get_site_url() . '/mycred-success?checkout_id={CHECKOUT_ID}',
+        'products' => array($plan['product_id']), // recurring product
+        'customer_email' => $user->user_email,
+        'external_customer_id' => (string)$user->ID,
+        'metadata' => $meta,
+        'success_url' => get_site_url().'/mycred-success?checkout_id={CHECKOUT_ID}',
     );
+    if ($use_custom) $payload['amount'] = $amount; // only for PWYW subs
 
-    error_log('Polar Checkout Request (main): ' . wp_json_encode($payload));
-    $resp = wp_remote_post($api_base . '/v1/checkouts', array(
-        'headers' => array('Authorization' => 'Bearer ' . $access_token, 'Content-Type' => 'application/json'),
-        'body'    => wp_json_encode($payload),
-        'timeout' => 30,
+    $resp = wp_remote_post($api.'/v1/checkouts', array(
+        'headers'=>array('Authorization'=>'Bearer '.$access,'Content-Type'=>'application/json'),
+        'body'=> wp_json_encode($payload),
+        'timeout'=>30,
     ));
-
-    if (is_wp_error($resp)) {
-        error_log('Polar API Error: ' . $resp->get_error_message());
-        wp_send_json_error(array('message' => 'API Error: ' . $resp->get_error_message()));
-    }
-
-    $code = wp_remote_retrieve_response_code($resp);
-    $raw  = wp_remote_retrieve_body($resp);
-    $body = json_decode($raw, true);
-    error_log('Polar Response Code (main): ' . $code);
-    error_log('Polar Response (main): ' . (is_array($body) ? print_r($body, true) : $raw));
-
-    if (($code === 200 || $code === 201) && is_array($body) && isset($body['url'])) {
-        wp_send_json_success(array('url' => $body['url'], 'checkout_id' => $body['id'] ?? ''));
-    }
-
-    // Fallback to /v1/checkouts/custom for older orgs
-    if (in_array($code, array(404, 405, 422), true)) {
-        $payload_fb = array(
-            'product_id'      => $product_id,
-            'amount'          => $amount,
-            'customer_email'  => $user->user_email,
-            'metadata'        => $meta,
-            'success_url'     => get_site_url() . '/mycred-success?checkout_id={CHECKOUT_ID}',
-        );
-        error_log('Polar Checkout Request (fallback): ' . wp_json_encode($payload_fb));
-        $resp2 = wp_remote_post($api_base . '/v1/checkouts/custom', array(
-            'headers' => array('Authorization' => 'Bearer ' . $access_token, 'Content-Type' => 'application/json'),
-            'body'    => wp_json_encode($payload_fb),
-            'timeout' => 30,
-        ));
-        $code2 = wp_remote_retrieve_response_code($resp2);
-        $raw2  = wp_remote_retrieve_body($resp2);
-        $body2 = json_decode($raw2, true);
-        error_log('Polar Response Code (fallback): ' . $code2);
-        error_log('Polar Response (fallback): ' . (is_array($body2) ? print_r($body2, true) : $raw2));
-        if (($code2 === 200 || $code2 === 201) && is_array($body2) && isset($body2['url'])) {
-            wp_send_json_success(array('url' => $body2['url'], 'checkout_id' => $body2['id'] ?? ''));
-        }
-        $err = is_array($body2) ? ($body2['detail'] ?? ($body2['message'] ?? 'Unknown error')) : 'Unexpected API response';
-        wp_send_json_error(array('message' => 'Checkout failed: ' . $err, 'status_code' => $code2, 'response' => $body2));
-    }
-
-    $err = is_array($body) ? ($body['detail'] ?? ($body['message'] ?? 'Unknown error')) : ('Unexpected API response: ' . substr($raw, 0, 300));
-    wp_send_json_error(array('message' => 'Checkout failed: ' . $err, 'status_code' => $code, 'response' => $body));
-}
-add_action('wp_ajax_mycred_polar_create_checkout', 'mycred_polar_create_checkout');
-
-/* -----------------------------------------------------------
-   AJAX - test connection
------------------------------------------------------------ */
-function mycred_polar_test_connection() {
-    check_ajax_referer('mycred_polar_test', 'nonce');
-    if (!current_user_can('manage_options')) wp_send_json_error(array('message' => 'Permission denied'));
-
-    $o = mycred_polar_get_options();
-    $mode = $o['mode'] ?? 'sandbox';
-    $access_token = ($mode === 'live') ? ($o['access_token_live'] ?? '') : ($o['access_token_sandbox'] ?? '');
-    $api = ($mode === 'live') ? 'https://api.polar.sh' : 'https://sandbox-api.polar.sh';
-
-    if (empty($access_token)) wp_send_json_error(array('message' => 'Access token not set.'));
-
-    $resp = wp_remote_get($api . '/v1/products', array(
-        'headers' => array('Authorization' => 'Bearer ' . $access_token, 'Content-Type' => 'application/json'),
-        'timeout' => 15
-    ));
-    if (is_wp_error($resp)) wp_send_json_error(array('message' => 'Connection error: ' . $resp->get_error_message()));
-
+    if (is_wp_error($resp)) wp_send_json_error(array('message'=>'API Error: '.$resp->get_error_message()));
     $code = wp_remote_retrieve_response_code($resp);
     $body = json_decode(wp_remote_retrieve_body($resp), true);
-    error_log('Polar Test Response Code: ' . $code);
-    error_log('Polar Test Response: ' . print_r($body, true));
-
-    if ($code == 200) {
-        wp_send_json_success(array('message' => '✅ Connection successful! (' . ucfirst($mode) . ' mode)', 'products_found' => isset($body['items']) ? count($body['items']) : 'N/A'));
-    } elseif ($code == 401) {
-        wp_send_json_error(array('message' => 'Invalid token. Ensure polar_at_ and scopes products:read, checkouts:write, orders:read.'));
-    } else {
-        $msg = is_array($body) ? ($body['detail'] ?? ($body['message'] ?? 'Unknown error')) : 'Unknown error';
-        wp_send_json_error(array('message' => 'Failed (Status ' . $code . '): ' . $msg));
+    if (($code===200||$code===201) && isset($body['url'])) {
+        wp_send_json_success(array('url'=>$body['url'],'checkout_id'=>$body['id']??''));
     }
+    $err = is_array($body)? ($body['detail'] ?? ($body['message'] ?? 'Unknown error')) : 'Unexpected response';
+    wp_send_json_error(array('message'=>'Subscription checkout failed: '.$err,'status_code'=>$code,'response'=>$body));
 }
-add_action('wp_ajax_mycred_polar_test_connection', 'mycred_polar_test_connection');
+add_action('wp_ajax_mycred_polar_create_subscription_checkout','mycred_polar_create_subscription_checkout');
 
 /* -----------------------------------------------------------
-   REST: Webhook endpoint
+   AJAX: Test connection
+----------------------------------------------------------- */
+function mycred_polar_test_connection() {
+    check_ajax_referer('mycred_polar_test','nonce');
+    if (!current_user_can('manage_options')) wp_send_json_error(array('message'=>'Permission denied'));
+
+    $o = mycred_polar_get_options();
+    $mode = $o['mode']; $access = ($mode==='live')? $o['access_token_live'] : $o['access_token_sandbox'];
+    $api = ($mode==='live')? 'https://api.polar.sh' : 'https://sandbox-api.polar.sh';
+
+    if (empty($access)) wp_send_json_error(array('message'=>'Access token not set.'));
+    $resp = wp_remote_get($api.'/v1/products', array('headers'=>array('Authorization'=>'Bearer '.$access,'Content-Type'=>'application/json'),'timeout'=>15));
+    if (is_wp_error($resp)) wp_send_json_error(array('message'=>'Connection error: '.$resp->get_error_message()));
+    $code = wp_remote_retrieve_response_code($resp);
+    $body = json_decode(wp_remote_retrieve_body($resp), true);
+    if ($code===200) {
+        wp_send_json_success(array('message'=>'Connection OK ('.ucfirst($mode).') — products: '.(isset($body['items'])? count($body['items']) : 'N/A')));
+    }
+    $msg = is_array($body)? ($body['detail'] ?? ($body['message'] ?? 'Unknown error')) : 'Unknown error';
+    wp_send_json_error(array('message'=>'Failed ('.$code.'): '.$msg));
+}
+add_action('wp_ajax_mycred_polar_test_connection','mycred_polar_test_connection');
+
+/* -----------------------------------------------------------
+   REST: Webhook (order.paid only)
 ----------------------------------------------------------- */
 function mycred_polar_register_webhook_endpoint() {
-    register_rest_route('mycred-polar/v1', '/webhook', array(
-        'methods' => 'POST',
-        'callback' => 'mycred_polar_handle_webhook',
-        'permission_callback' => '__return_true',
+    register_rest_route('mycred-polar/v1','/webhook', array(
+        'methods'=>'POST',
+        'callback'=>'mycred_polar_handle_webhook',
+        'permission_callback'=>'__return_true',
     ));
 }
-add_action('rest_api_init', 'mycred_polar_register_webhook_endpoint');
+add_action('rest_api_init','mycred_polar_register_webhook_endpoint');
 
 /* Svix/Standard Webhooks verification */
 function mycred_polar_verify_webhook_signature_std(WP_REST_Request $request, string $payload, string $secret): bool {
     $id = $request->get_header('webhook-id') ?: $request->get_header('svix-id');
     $ts = $request->get_header('webhook-timestamp') ?: $request->get_header('svix-timestamp');
-    $sig = $request->get_header('webhook-signature') ?: $request->get_header('svix-signature');
+    $sig= $request->get_header('webhook-signature') ?: $request->get_header('svix-signature');
 
-    if (empty($id) || empty($ts) || empty($sig)) { error_log('Polar Webhook: missing required headers'); return false; }
+    if (empty($id)||empty($ts)||empty($sig)) { error_log('Polar Webhook: missing required headers'); return false; }
     if (!ctype_digit((string)$ts) || abs(time() - (int)$ts) > 300) { error_log('Polar Webhook: timestamp outside tolerance'); return false; }
 
-    // Normalize whsec_ secret (base64 or base64url)
+    // Secret whsec_... (base64 or base64url)
     $raw = preg_match('/^whsec_(.+)$/', trim($secret), $m) ? $m[1] : trim($secret);
     $key = base64_decode($raw, true);
     if ($key === false) {
-        $b64 = strtr($raw, '-_', '+/');
-        $b64 .= str_repeat('=', (4 - strlen($b64) % 4) % 4);
+        $b64 = strtr($raw, '-_', '+/'); $b64 .= str_repeat('=', (4 - strlen($b64) % 4) % 4);
         $key = base64_decode($b64, true);
     }
-    if ($key === false) { error_log('Polar Webhook: invalid secret format after normalization'); return false; }
+    if ($key === false) { error_log('Polar Webhook: invalid secret after normalization'); return false; }
 
-    $signed = $id . '.' . $ts . '.' . $payload;
+    $signed = $id.'.'.$ts.'.'.$payload;
     $expected = base64_encode(hash_hmac('sha256', $signed, $key, true));
 
-    // Accept "v1,..." or "v1=..."
-    $candidates = preg_split('/\s+/', trim($sig));
-    foreach ($candidates as $entry) {
-        $entry = trim($entry);
-        $provided = null;
-        if (stripos($entry, 'v1,') === 0) $provided = substr($entry, 3);
-        elseif (stripos($entry, 'v1=') === 0) $provided = substr($entry, 3);
-        if ($provided && hash_equals($expected, $provided)) {
-            error_log('Polar Webhook: signature verified');
-            return true;
-        }
+    // Signature may contain multiple entries; accept v1,xxx or v1=xxx
+    foreach (preg_split('/\s+/', trim($sig)) as $entry) {
+        $entry = trim($entry); if ($entry==='') continue;
+        $cand = null;
+        if (stripos($entry, 'v1,')===0) $cand = substr($entry, 3);
+        elseif (stripos($entry, 'v1=')===0) $cand = substr($entry, 3);
+        if ($cand && hash_equals($expected, $cand)) { error_log('Polar Webhook: signature verified'); return true; }
     }
     error_log('Polar Webhook: signature verification failed');
     return false;
 }
 
-/* Award points helper (idempotent) */
+/* Award points (idempotent + short lock) */
 function mycred_polar_award_points($user_id, $points, $order_id, $amount_cents, $raw_payload = '') {
     global $wpdb;
-    $table = $wpdb->prefix . 'mycred_polar_logs';
+    mycred_polar_ensure_logs_table();
 
-    // Idempotency: already have this order?
-    $existing = $wpdb->get_row($wpdb->prepare("SELECT id FROM $table WHERE order_id = %s", $order_id));
-    if ($existing) {
-        error_log('Polar Award: already processed ' . $order_id);
-        return true;
-    }
+    $lock_key = 'mycred_polar_lock_'.md5($order_id);
+    if (get_transient($lock_key)) { error_log('Polar Award: lock present for '.$order_id); return true; }
+    set_transient($lock_key, 1, 60);
+
+    $table = $wpdb->prefix . 'mycred_polar_logs';
+    $exists = $wpdb->get_var($wpdb->prepare("SELECT id FROM $table WHERE order_id=%s LIMIT 1", $order_id));
+    if ($exists) { delete_transient($lock_key); error_log('Polar Award: already processed '.$order_id); return true; }
 
     $o = mycred_polar_get_options();
-    $point_type = $o['point_type'] ?? 'mycred_default';
-    $log_entry = $o['log_entry'] ?? 'Points purchased via Polar.sh (Order: %order_id%)';
-    $log_entry = str_replace(
-        array('%points%', '%order_id%', '%amount%'),
-        array($points, $order_id, '$' . number_format($amount_cents / 100, 2)),
-        $log_entry
-    );
+    $pt = $o['point_type'] ?? 'mycred_default';
+    $log = $o['log_entry'] ?? 'Points purchased via Polar.sh (Order: %order_id%)';
+    $log = str_replace(array('%points%','%order_id%','%amount%'), array($points,$order_id,'$'.number_format($amount_cents/100,2)), $log);
 
-    if (!function_exists('mycred_add')) return false;
+    if (!function_exists('mycred_add')) { delete_transient($lock_key); return false; }
 
-    $ok = mycred_add('polar_purchase', $user_id, $points, $log_entry, 0, '', $point_type);
+    $ok = mycred_add('polar_purchase', $user_id, $points, $log, 0, '', $pt);
     if ($ok === false) {
-        error_log('Polar Award: mycred_add failed for user ' . $user_id);
         $wpdb->insert($table, array(
-            'user_id' => $user_id, 'order_id' => $order_id, 'points' => $points,
-            'amount' => $amount_cents, 'status' => 'failed', 'webhook_data' => $raw_payload
+            'user_id'=>$user_id,'order_id'=>$order_id,'points'=>$points,'amount'=>$amount_cents,'status'=>'failed','webhook_data'=>$raw_payload
         ));
+        delete_transient($lock_key);
         return false;
     }
 
     $wpdb->insert($table, array(
-        'user_id' => $user_id, 'order_id' => $order_id, 'points' => $points,
-        'amount' => $amount_cents, 'status' => 'success', 'webhook_data' => $raw_payload
+        'user_id'=>$user_id,'order_id'=>$order_id,'points'=>$points,'amount'=>$amount_cents,'status'=>'success','webhook_data'=>$raw_payload
     ));
-
-    error_log("Polar Award: awarded {$points} points to user {$user_id} (order {$order_id})");
+    delete_transient($lock_key);
+    error_log("Polar Award: +{$points} pts to user {$user_id} (order {$order_id})");
     return true;
 }
 
-/* -----------------------------------------------------------
-   Webhook handler (order.paid preferred, checkout.updated fallback)
------------------------------------------------------------ */
+/* Helper: fetch subscription to read metadata (for renewals that lack metadata) */
+function mycred_polar_fetch_subscription_meta($sub_id) {
+    $o = mycred_polar_get_options();
+    $mode = $o['mode']; $access = ($mode==='live')? $o['access_token_live'] : $o['access_token_sandbox'];
+    $api  = ($mode==='live')? 'https://api.polar.sh' : 'https://sandbox-api.polar.sh';
+    if (empty($access) || empty($sub_id)) return array();
+    $r = wp_remote_get($api.'/v1/subscriptions/'.rawurlencode($sub_id), array('headers'=>array('Authorization'=>'Bearer '.$access,'Content-Type'=>'application/json'),'timeout'=>15));
+    if (is_wp_error($r)) return array();
+    $code = wp_remote_retrieve_response_code($r);
+    $body = json_decode(wp_remote_retrieve_body($r), true);
+    if ($code===200 && is_array($body)) return $body['metadata'] ?? array();
+    return array();
+}
+
+/* Webhook handler: ONLY order.paid (prevents double credits). Ignores checkout.updated. */
 function mycred_polar_handle_webhook($request) {
-    if (!mycred_polar_check_mycred()) return new WP_REST_Response(array('error' => 'myCred not active'), 500);
+    if (!mycred_polar_check_mycred()) return new WP_REST_Response(array('error'=>'myCred not active'), 500);
 
     $o = mycred_polar_get_options();
-    $webhook_secret = $o['webhook_secret'] ?? '';
+    $secret = $o['webhook_secret'] ?? '';
 
-    $body = $request->get_body();
-    error_log('Polar Webhook: received ' . strlen($body) . ' bytes');
+    $payload = $request->get_body();
+    error_log('Polar Webhook: received '.strlen($payload).' bytes');
 
-    if (!empty($webhook_secret)) {
-        if (!mycred_polar_verify_webhook_signature_std($request, $body, $webhook_secret)) {
-            return new WP_REST_Response(array('error' => 'Invalid signature'), 403);
+    if (!empty($secret)) {
+        if (!mycred_polar_verify_webhook_signature_std($request, $payload, $secret)) {
+            return new WP_REST_Response(array('error'=>'Invalid signature'), 403);
         }
     } else {
         error_log('Polar Webhook: verification disabled');
     }
 
-    $data = json_decode($body, true);
-    if (!is_array($data)) {
-        error_log('Polar Webhook: invalid JSON');
-        return new WP_REST_Response(array('error' => 'Invalid payload'), 400);
+    $evt = json_decode($payload, true);
+    if (!is_array($evt)) return new WP_REST_Response(array('error'=>'Invalid payload'), 400);
+
+    $type = $evt['type'] ?? '';
+    error_log('Polar Webhook: event '.$type);
+
+    // Process only order.paid (covers both one-time and subscription cycles)
+    if ($type !== 'order.paid') {
+        return new WP_REST_Response(array('success'=>true,'message'=>'Event ignored'), 200);
     }
 
-    $event_type = $data['type'] ?? '';
-    error_log('Polar Webhook: event ' . $event_type);
+    $order = $evt['data'] ?? array();
+    $status = $order['status'] ?? '';
+    if ($status !== 'paid') return new WP_REST_Response(array('success'=>true,'message'=>'Order not paid'), 200);
 
-    $user_id = 0; $points = 0; $order_id = ''; $amount = 0;
+    $order_id = $order['id'] ?? '';
+    $amount   = intval($order['net_amount'] ?? ($order['amount'] ?? 0)); // cents
+    $meta     = $order['metadata'] ?? array();
+    $user_id  = intval($meta['user_id'] ?? 0);
 
-    if ($event_type === 'order.paid' || $event_type === 'order.updated') {
-        $order = $data['data'] ?? array();
-        if ($event_type === 'order.updated' && (($order['status'] ?? '') !== 'paid')) {
-            return new WP_REST_Response(array('success' => true, 'message' => 'Order not paid yet'), 200);
-        }
-        $meta = $order['metadata'] ?? array();
-        $user_id  = intval($meta['user_id'] ?? 0);
-        $points   = intval($meta['points'] ?? 0);
-        $order_id = $order['id'] ?? '';
-        $amount   = intval($order['net_amount'] ?? ($order['amount'] ?? 0));
-        if ($user_id > 0 && $points > 0 && $order_id !== '') {
-            $ok = mycred_polar_award_points($user_id, $points, $order_id, $amount, $body);
-            return new WP_REST_Response(array('success' => $ok), $ok ? 202 : 500);
-        }
-        return new WP_REST_Response(array('error' => 'Invalid data'), 400);
+    // Determine points (one-time or subscription)
+    $points = 0;
+    if (isset($meta['points'])) $points = intval($meta['points']); // one-time flow
+    if ($points<=0 && isset($meta['points_per_cycle'])) $points = intval($meta['points_per_cycle']); // subscription initial
+
+    // For renewals, metadata may be missing on the order: fetch subscription metadata
+    if ($points<=0 && !empty($order['subscription_id'])) {
+        $smeta = mycred_polar_fetch_subscription_meta($order['subscription_id']);
+        if (!empty($smeta['points_per_cycle'])) $points = intval($smeta['points_per_cycle']);
+        if ($points<=0 && !empty($smeta['points'])) $points = intval($smeta['points']);
     }
 
-    if ($event_type === 'checkout.updated') {
-        $checkout = $data['data'] ?? array();
-        if (($checkout['status'] ?? '') !== 'succeeded') {
-            return new WP_REST_Response(array('success' => true, 'message' => 'Checkout not succeeded'), 200);
-        }
-        $meta = $checkout['metadata'] ?? array();
-        $user_id  = intval($meta['user_id'] ?? 0);
-        $points   = intval($meta['points'] ?? 0);
-        $order_id = $checkout['id'] ?? '';
-        $amount   = intval($checkout['net_amount'] ?? ($checkout['amount'] ?? ($meta['amount_cents'] ?? 0)));
-        if ($user_id > 0 && $points > 0 && $order_id !== '') {
-            $ok = mycred_polar_award_points($user_id, $points, $order_id, $amount, $body);
-            return new WP_REST_Response(array('success' => $ok), $ok ? 202 : 500);
-        }
-        return new WP_REST_Response(array('error' => 'Invalid data'), 400);
+    if ($user_id<=0 || $points<=0 || empty($order_id)) {
+        error_log('Polar Webhook: missing data (user/points/order)');
+        return new WP_REST_Response(array('error'=>'Invalid data'), 400);
     }
 
-    return new WP_REST_Response(array('success' => true, 'message' => 'Event ignored'), 200);
+    $ok = mycred_polar_award_points($user_id, $points, $order_id, $amount, $payload);
+    return new WP_REST_Response(array('success'=>$ok), $ok ? 202 : 500);
 }
 
 /* -----------------------------------------------------------
-   Success page: server-side fallback to credit points
-   1) Try GET /v1/orders?checkout_id=... (preferred)
-   2) Fallback to GET /v1/checkouts/{id} if needed
+   Success page: fallback credit (safe & idempotent)
 ----------------------------------------------------------- */
 function mycred_polar_success_page() {
     if (!isset($_GET['checkout_id'])) return;
-
     $checkout_id = sanitize_text_field($_GET['checkout_id']);
-    $o = mycred_polar_get_options();
-    $mode = $o['mode'] ?? 'sandbox';
-    $access_token = ($mode === 'live') ? ($o['access_token_live'] ?? '') : ($o['access_token_sandbox'] ?? '');
-    $api_base = ($mode === 'live') ? 'https://api.polar.sh' : 'https://sandbox-api.polar.sh';
 
-    if (!empty($access_token) && !empty($checkout_id) && mycred_polar_check_mycred()) {
-        // Small polling: try to see the order that matches this checkout
-        for ($i = 0; $i < 3; $i++) {
-            $url = add_query_arg(array('checkout_id' => $checkout_id), $api_base . '/v1/orders');
-            $resp = wp_remote_get($url, array('headers' => array('Authorization' => 'Bearer ' . $access_token, 'Content-Type' => 'application/json'), 'timeout' => 15));
+    // Attempt to map checkout -> order and award if already paid (idempotent)
+    $o = mycred_polar_get_options();
+    $mode = $o['mode']; $access = ($mode==='live')? $o['access_token_live'] : $o['access_token_sandbox'];
+    $api  = ($mode==='live')? 'https://api.polar.sh' : 'https://sandbox-api.polar.sh';
+
+    if (!empty($access) && !empty($checkout_id) && mycred_polar_check_mycred()) {
+        // Try up to 3 quick polls
+        for ($i=0; $i<3; $i++) {
+            $url = add_query_arg(array('checkout_id'=>$checkout_id), $api.'/v1/orders');
+            $resp = wp_remote_get($url, array('headers'=>array('Authorization'=>'Bearer '.$access,'Content-Type'=>'application/json'),'timeout'=>15));
             if (!is_wp_error($resp)) {
                 $code = wp_remote_retrieve_response_code($resp);
                 $body = json_decode(wp_remote_retrieve_body($resp), true);
-                if ($code === 200 && is_array($body) && !empty($body['items'])) {
+                if ($code===200 && !empty($body['items'])) {
                     $order = $body['items'][0];
                     if (($order['status'] ?? '') === 'paid') {
-                        $meta     = $order['metadata'] ?? array();
-                        $user_id  = intval($meta['user_id'] ?? 0);
-                        $points   = intval($meta['points'] ?? 0);
-                        $order_id = $order['id'] ?? $checkout_id;
-                        $amount   = intval($order['net_amount'] ?? ($order['amount'] ?? 0));
-                        if ($user_id > 0 && $points > 0) {
-                            mycred_polar_award_points($user_id, $points, $order_id, $amount, 'success-page');
+                        $meta = $order['metadata'] ?? array();
+                        $user_id = intval($meta['user_id'] ?? 0);
+                        $points = 0;
+                        if (isset($meta['points'])) $points = intval($meta['points']);
+                        if ($points<=0 && isset($meta['points_per_cycle'])) $points = intval($meta['points_per_cycle']);
+                        if ($points<=0 && !empty($order['subscription_id'])) {
+                            $smeta = mycred_polar_fetch_subscription_meta($order['subscription_id']);
+                            if (!empty($smeta['points_per_cycle'])) $points = intval($smeta['points_per_cycle']);
+                            if ($points<=0 && !empty($smeta['points'])) $points = intval($smeta['points']);
+                        }
+                        $amount = intval($order['net_amount'] ?? ($order['amount'] ?? 0));
+                        $oid = $order['id'] ?? $checkout_id;
+                        if ($user_id>0 && $points>0) {
+                            mycred_polar_award_points($user_id, $points, $oid, $amount, 'success-fallback');
                         }
                         break;
                     }
                 }
             }
-            usleep(500000); // 0.5s
-        }
-
-        // Fallback: check checkout directly for succeeded status if no paid order was found yet
-        $resp2 = wp_remote_get($api_base . '/v1/checkouts/' . rawurlencode($checkout_id), array('headers' => array('Authorization' => 'Bearer ' . $access_token, 'Content-Type' => 'application/json'), 'timeout' => 15));
-        if (!is_wp_error($resp2)) {
-            $code2 = wp_remote_retrieve_response_code($resp2);
-            $checkout = json_decode(wp_remote_retrieve_body($resp2), true);
-            if ($code2 === 200 && is_array($checkout) && (($checkout['status'] ?? '') === 'succeeded')) {
-                $meta     = $checkout['metadata'] ?? array();
-                $user_id  = intval($meta['user_id'] ?? 0);
-                $points   = intval($meta['points'] ?? 0);
-                $order_id = $checkout['id'] ?? $checkout_id;
-                $amount   = intval($checkout['net_amount'] ?? ($checkout['amount'] ?? ($meta['amount_cents'] ?? 0)));
-                if ($user_id > 0 && $points > 0) {
-                    mycred_polar_award_points($user_id, $points, $order_id, $amount, 'success-page-checkout');
-                }
-            }
+            usleep(400000); // 0.4s
         }
     }
 
-    // Render a simple success page
+    // Render success HTML
     ?>
     <!DOCTYPE html>
     <html>
@@ -729,7 +838,7 @@ function mycred_polar_success_page() {
         <meta name="robots" content="noindex,nofollow">
         <style>
             body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f0f0f0; }
-            .success-box { background: white; border: 3px solid #00a32a; border-radius: 10px; padding: 40px; max-width: 500px; margin: 0 auto; }
+            .success-box { background: white; border: 3px solid #00a32a; border-radius: 10px; padding: 40px; max-width: 520px; margin: 0 auto; }
             .checkmark { font-size: 80px; color: #00a32a; }
             h1 { color: #00a32a; }
             .button { display: inline-block; padding: 15px 30px; background: #0073aa; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px; font-weight: bold; }
@@ -739,7 +848,7 @@ function mycred_polar_success_page() {
         <div class="success-box">
             <div class="checkmark">✓</div>
             <h1>Payment Successful!</h1>
-            <p>Thank you for your purchase. Your points will appear shortly (usually within a few seconds).</p>
+            <p>Thanks! Your points will appear shortly (usually within a few seconds).</p>
             <a href="<?php echo esc_url(home_url()); ?>" class="button">Return to Home</a>
         </div>
     </body>
@@ -747,13 +856,6 @@ function mycred_polar_success_page() {
     <?php
     exit;
 }
-
-function mycred_polar_rewrite_rules() { add_rewrite_rule('^mycred-success/?', 'index.php?mycred_polar_success=1', 'top'); }
-add_action('init', 'mycred_polar_rewrite_rules');
-function mycred_polar_query_vars($vars) { $vars[] = 'mycred_polar_success'; return $vars; }
-add_filter('query_vars', 'mycred_polar_query_vars');
-function mycred_polar_template_redirect() { if (get_query_var('mycred_polar_success')) mycred_polar_success_page(); }
-add_action('template_redirect', 'mycred_polar_template_redirect');
 
 /* -----------------------------------------------------------
    Admin row settings link
@@ -763,5 +865,4 @@ function mycred_polar_settings_link($links) {
     array_unshift($links, $settings_link);
     return $links;
 }
-
 add_filter('plugin_action_links_' . plugin_basename(__FILE__), 'mycred_polar_settings_link');

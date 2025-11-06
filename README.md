@@ -1,6 +1,6 @@
 # myCred Polar.sh Integration
 
-![Version](https://img.shields.io/badge/version-3.5.2-blue.svg)
+![Version](https://img.shields.io/badge/version-1.0.9-blue.svg)
 ![WordPress](https://img.shields.io/badge/WordPress-5.0%2B-brightgreen.svg)
 ![PHP](https://img.shields.io/badge/PHP-7.4%2B-purple.svg)
 ![License](https://img.shields.io/badge/license-GPL--2.0-orange.svg)
@@ -9,7 +9,7 @@
 
 ## 📸 Screenshots
 
-![myCred Polar Interface](screenshot.png)
+![myCred Polar Interface](https://i.imgur.com/jAp08Lxl.png)
 
 ## ✨ Features
 
@@ -315,7 +315,7 @@ Contributions are welcome! Please follow these steps:
 
 ## 📝 Changelog
 
-### Version 3.5.2 (2024-11-06)
+### Version 1.0.9
 
 - ✨ Added modern dark UI design
 - 🎨 Improved subscription management interface
@@ -323,7 +323,7 @@ Contributions are welcome! Please follow these steps:
 - 📊 Enhanced admin dashboard with KPIs
 - 🐛 Various bug fixes and improvements
 
-### Version 3.5.0
+### Version 1.0.5
 
 - ✨ Added Customer Portal integration
 - 🔄 Implemented subscription cancellation
@@ -331,7 +331,7 @@ Contributions are welcome! Please follow these steps:
 - 🎯 PWYW recalculation support
 - 🔐 Enhanced webhook security
 
-### Version 3.0.0
+### Version 1.0.2
 
 - 🚀 Complete plugin restructure
 - 📁 Multi-file architecture
